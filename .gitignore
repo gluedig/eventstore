@@ -3,3 +3,6 @@
 tags
 cscope.out
 *.log
+*.o
+eventstore
+*.orig

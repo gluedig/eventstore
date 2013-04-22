@@ -1,0 +1,5 @@
+.depend
+*.swp
+tags
+cscope.out
+*.log

@@ -3,7 +3,7 @@ CXX=g++
 RM=rm -f
 CPPFLAGS=-g -std=c++0x -I /usr/local/include
 LDFLAGS=-g
-LDLIBS=-lczmq -lzmq
+LDLIBS=-lczmq -lzmq -lpthread
 
 SRCS = $(wildcard ./*.cpp)
 OBJS=$(subst .cpp,.o,$(SRCS))

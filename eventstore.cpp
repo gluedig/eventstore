@@ -137,7 +137,7 @@ static int add_event(sqlite3 *sql, byte *event_data, size_t data_len)
         assert(data_str);
         memset(data_str, 0, data_len+1);
         memcpy(data_str, event_data, data_len);
-        fprintf(stderr, "event len: %d data: %s\n", data_len, data_str);
+        fprintf(stderr, "event len: %ld data: %s\n", data_len, data_str);
 
         char *zSQL = sqlite3_mprintf("INSERT INTO events (event) VALUES('%q')", data_str);
         char *err_msg = 0;
@@ -205,7 +205,7 @@ void backup_handler(int sig)
         fprintf(stderr, "startind db backup to %s\n", backupfile);
         int rc;
         if ((rc=backupDb(db, backupfile)) != SQLITE_OK) {
-                fprintf(stderr, "error creating backup %s\n", sqlite3_errstr(rc));
+                fprintf(stderr, "error creating backup (%d)\n", rc);
         } else {
                 fprintf(stderr, "db backup completed\n");
         }

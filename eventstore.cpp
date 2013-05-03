@@ -1,5 +1,9 @@
 #include <string>
 #include <set>
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <mutex>
 
 #include <string.h>
 #include <signal.h>
@@ -10,10 +14,41 @@
 #include <sqlite3.h>
 
 #define BEACON_PORT 5555
+#define CLEANUP_PERIOD 30
+#define EVENTS_LIMIT 10000
+
 static const char *event_filter = "EVENT_SRC";
 static const char *db_file = "eventstore.db";
 static const char *create_tables_sql = "CREATE TABLE events(ID INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT);";
 static const char *count_events_sql = "SELECT COUNT(*) FROM events;";
+
+static int count_events(sqlite3 *sql, int *count);
+
+struct CleanupFunction {
+        void cleanup(sqlite3 *database, std::atomic_bool *run, int *lost_events, int limit) {
+                while (run->load()) {
+                        int count;
+                        std::this_thread::sleep_for(std::chrono::seconds(CLEANUP_PERIOD));
+                        if (! run->load())
+                                break;
+
+                        count_events(database, &count);
+                        if (count > limit) {
+                                int to_remove = count - limit;
+                                fprintf(stderr, "cleanup removing %d events (limit %d total %d)\n", to_remove, limit, count);
+                                char *zSQL = sqlite3_mprintf("DELETE FROM events WHERE id IN (SELECT id FROM EVENTS ORDER BY id LIMIT %d)", to_remove);
+                                char *err_msg = 0;
+                                if (sqlite3_exec(database, zSQL, 0, 0, &err_msg)) {
+                                        fprintf(stderr, "Cannot remove events form db %s\n", err_msg);
+                                        sqlite3_free(err_msg);
+                                } else {
+                                        *lost_events += to_remove;
+                                }
+                                sqlite3_free(zSQL);
+                        }
+                }
+        }
+};
 
 zctx_t *ctx;
 zbeacon_t *beacon_ctx;
@@ -21,8 +56,18 @@ zmq_pollitem_t *pollitems;
 std::set<std::string> poll_addrs;
 sqlite3 *db;
 
+CleanupFunction *cf;
+std::thread *cleanup_thread;
+std::atomic_bool *cleanup_thread_flag;
+std::once_flag terminate_flag;
+
+int lost_events = 0;
+int processed_events = 0;
+int store_id = -1;
+
 void finish(int ret)
 {
+        fprintf(stderr, "Terminating, waiting for threads for finish...\n");
         if (beacon_ctx) {
                 zbeacon_unsubscribe(beacon_ctx);
                 zbeacon_destroy(&beacon_ctx);
@@ -33,15 +78,30 @@ void finish(int ret)
         if (ctx)
                 zctx_destroy(&ctx);
 
-        if(db)
+        if(cleanup_thread) {
+                cleanup_thread_flag->store(false);
+                cleanup_thread->join();
+                delete cf;
+                delete cleanup_thread;
+                delete cleanup_thread_flag;
+        }
+
+        int count = 0;
+        if(db) {
+                count_events(db, &count);
                 sqlite3_close(db);
+        }
+
+        fprintf(stderr, "Done, total processed events %d lost events %d events in db %d\n",
+                processed_events, lost_events, count);
+
         exit(ret);
 }
 
 void terminate_handler(int sig)
 {
         signal(sig, SIG_DFL);
-        finish(0);
+        std::call_once(terminate_flag, finish, 0);
 }
 
 zmq_pollitem_t *new_pollentry(std::string addr, zmq_pollitem_t *items, int *items_no)
@@ -149,6 +209,7 @@ static int add_event(sqlite3 *sql, byte *event_data, size_t data_len)
         sqlite3_free(zSQL);
 
         free(data_str);
+        processed_events++;
         return ret;
 }
 
@@ -208,17 +269,37 @@ void backup_handler(int sig)
                 fprintf(stderr, "error creating backup (%d)\n", rc);
         } else {
                 fprintf(stderr, "db backup completed\n");
+                lost_events = 0;
         }
 }
 
 
 int main(int argc, char **argv)
 {
+        int limit = EVENTS_LIMIT;
+
+        if (argc < 2) {
+                fprintf(stderr, "usage: %s store_id [event limit]\n",argv[0]);
+                exit(1);
+        } else {
+                store_id = atoi(argv[1]);
+                if (argc == 3)
+                        limit = atoi(argv[2]);
+        }
+        fprintf(stderr, "Starting, event store id: 0x%x events limit %d\n", store_id, limit);
+
+
+        sigset_t signal_mask;
+        sigemptyset(&signal_mask);
+        sigaddset(&signal_mask, SIGINT);
+        sigaddset(&signal_mask, SIGUSR1);
+        int rc = pthread_sigmask (SIG_BLOCK, &signal_mask, NULL);
+        if (rc != 0)
+                fprintf(stderr, "failed to set sigmask\n");
+
         ctx = zctx_new ();
         assert (ctx);
 
-        signal(SIGINT, terminate_handler);
-        signal(SIGUSR1, backup_handler);
         db = open_or_create_db();
 
         beacon_ctx = zbeacon_new(BEACON_PORT);
@@ -231,6 +312,17 @@ int main(int argc, char **argv)
         beacon_item->fd = 0;
         beacon_item->events = ZMQ_POLLIN;
         beacon_item->revents = 0;
+
+        cf = new CleanupFunction();
+        cleanup_thread_flag = new std::atomic_bool(true);
+        cleanup_thread = new std::thread(std::bind(&CleanupFunction::cleanup, std::ref(cf), db, cleanup_thread_flag, &lost_events, limit));
+
+        rc = pthread_sigmask (SIG_UNBLOCK, &signal_mask, NULL);
+        if (rc != 0)
+                fprintf(stderr, "failed to set sigmask\n");
+
+        signal(SIGINT, terminate_handler);
+        signal(SIGUSR1, backup_handler);
 
         while (zmq_poll (pollitems, no_pollitems, -1)) {
 

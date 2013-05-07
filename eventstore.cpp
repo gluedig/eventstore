@@ -14,13 +14,9 @@
 #include <sqlite3.h>
 
 #define BEACON_PORT 5555
-#define CLEANUP_PERIOD 30
+#define CLEANUP_PERIOD 60
 #define EVENTS_LIMIT 10000
 
-static const char *event_filter = "EVENT_SRC";
-static const char *db_file = "eventstore.db";
-static const char *create_tables_sql = "CREATE TABLE events(ID INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT);";
-static const char *count_events_sql = "SELECT COUNT(*) FROM events;";
 
 static int count_events(sqlite3 *sql, int *count);
 
@@ -140,6 +136,7 @@ static int event_count_clbk(void *count, int argc, char **argv, char **column_na
         return SQLITE_OK;
 }
 
+static const char *count_events_sql = "SELECT COUNT(*) FROM events;";
 static int count_events(sqlite3 *sql, int *count)
 {
         char *err_msg = 0;
@@ -152,6 +149,38 @@ static int count_events(sqlite3 *sql, int *count)
         return err;
 }
 
+static int event_no_clbk(void *count, int argc, char **argv, char **column_names)
+{
+        int *events_no = (int *)count;
+        int i;
+        for(i=0; i<argc; i++) {
+//                printf("%s = %s\n", column_names[i], argv[i] ? argv[i] : "NULL");
+                if (!strcmp(column_names[i], "ID") && argv[i]) {
+                        *events_no = atoi(argv[i]);
+                        break;
+                }
+        }
+
+        return SQLITE_OK;
+}
+
+static int get_event_no(sqlite3 *sql, int *count, bool last)
+{
+        char *err_msg = 0;
+        int err = SQLITE_OK;
+        static const char *first_eventno_sql = "SELECT id FROM events ORDER BY id ASC LIMIT (1)";
+        static const char *last_eventno_sql = "SELECT id FROM events ORDER BY id DESC LIMIT (1)";
+        if ((err = sqlite3_exec(sql, last ? last_eventno_sql : first_eventno_sql,
+                                event_no_clbk, count, &err_msg))) {
+                fprintf(stderr, "Cannot get event number: %s\n", err_msg);
+                sqlite3_free(err_msg);
+        }
+
+        return err;
+}
+
+static const char *db_file = "eventstore.db";
+static const char *create_tables_sql = "CREATE TABLE events(ID INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT);";
 static sqlite3 *open_or_create_db()
 {
         sqlite3 *tmp;
@@ -190,6 +219,8 @@ static sqlite3 *open_or_create_db()
         }
 }
 
+static const char progress[] = { '|', '/', '-', '\\'};
+
 static int add_event(sqlite3 *sql, byte *event_data, size_t data_len)
 {
         int ret = 0;
@@ -197,7 +228,7 @@ static int add_event(sqlite3 *sql, byte *event_data, size_t data_len)
         assert(data_str);
         memset(data_str, 0, data_len+1);
         memcpy(data_str, event_data, data_len);
-        fprintf(stderr, "event len: %ld data: %s\n", data_len, data_str);
+//        fprintf(stderr, "event len: %ld data: %s\n", data_len, data_str);
 
         char *zSQL = sqlite3_mprintf("INSERT INTO events (event) VALUES('%q')", data_str);
         char *err_msg = 0;
@@ -210,20 +241,31 @@ static int add_event(sqlite3 *sql, byte *event_data, size_t data_len)
 
         free(data_str);
         processed_events++;
+        fprintf(stdout, "\b%c", progress[processed_events % 4]);
         return ret;
 }
 
+static const char *create_meta_table_sql = "CREATE TABLE meta(timestamp INTEGER, store_id INTEGER, first_event INTEGER, last_event INTEGER, lost_events INTEGER);";
 int backupDb(sqlite3 *pDb,               /* Database to back up */
-             const char *zFilename      /* Name of file to back up to */
+             const char *zFilename,      /* Name of file to back up to */
+             const time_t *time
             )
 {
         int rc;                     /* Function return code */
         sqlite3 *pFile;             /* Database connection opened on zFilename */
         sqlite3_backup *pBackup;    /* Backup handle used to copy data */
+        char *err_msg = 0;
+
+        if ((rc = sqlite3_exec(pDb, "VACUUM", NULL, NULL, &err_msg))) {
+                fprintf(stderr, "error VACUUMing maind db %s\n", err_msg);
+                sqlite3_free(err_msg);
+                goto done;
+
+        }
 
         /* Open the database file identified by zFilename. */
         rc = sqlite3_open(zFilename, &pFile);
-        if( rc==SQLITE_OK ) {
+        if ( rc==SQLITE_OK ) {
 
                 /* Open the sqlite3_backup object used to accomplish the transfer */
                 pBackup = sqlite3_backup_init(pFile, "main", pDb, "main");
@@ -234,7 +276,7 @@ int backupDb(sqlite3 *pDb,               /* Database to back up */
                         * indicates that there are still further pages to copy, sleep for
                         * 250 ms before repeating. */
                         do {
-                                rc = sqlite3_backup_step(pBackup, 5);
+                                rc = sqlite3_backup_step(pBackup, 50);
                                 if( rc==SQLITE_OK || rc==SQLITE_BUSY || rc==SQLITE_LOCKED ) {
                                         sqlite3_sleep(250);
                                 }
@@ -246,8 +288,36 @@ int backupDb(sqlite3 *pDb,               /* Database to back up */
                 rc = sqlite3_errcode(pFile);
         }
 
-        /* Close the database connection opened on database file zFilename
-        *   ** and return the result of this function. */
+        if ( rc==SQLITE_OK ) {
+                fprintf(stderr, "backup finished, adding metadata\n");
+                if ((rc = sqlite3_exec(pFile, create_meta_table_sql, NULL, NULL, &err_msg))) {
+                        fprintf(stderr, "cannot create meta table: %s\n", err_msg);
+                        sqlite3_free(err_msg);
+                        goto done;
+                }
+                int first_event;
+                if ((rc = get_event_no(pFile, &first_event, false))) {
+                        fprintf(stderr, "cannot get firt event no\n");
+                        goto done;
+                }
+                int last_event;
+                if ((rc = get_event_no(pFile, &last_event, true))) {
+                        fprintf(stderr, "cannot get firt event no\n");
+                        goto done;
+                }
+                char *zSQL = sqlite3_mprintf("INSERT INTO meta (timestamp, store_id, first_event, last_event, lost_events) VALUES(%d, %d, %d, %d, %d)",
+                                             *time, store_id, first_event, last_event, lost_events);
+
+                if ((rc = sqlite3_exec(pFile, zSQL, 0, 0, &err_msg))) {
+                        fprintf(stderr, "Cannot add meta to backup db: %s\n", err_msg);
+                        sqlite3_free(err_msg);
+                        sqlite3_free(zSQL);
+                        goto done;
+                }
+                sqlite3_free(zSQL);
+        }
+
+done:
         (void)sqlite3_close(pFile);
         return rc;
 }
@@ -263,9 +333,9 @@ void backup_handler(int sig)
 
         strftime(date, 256, "%F-%T", localtime(&curr_time));
         sprintf(backupfile, "./backup/%s_%s.bak", db_file, date);
-        fprintf(stderr, "startind db backup to %s\n", backupfile);
+        fprintf(stderr, "starting db backup to %s\n", backupfile);
         int rc;
-        if ((rc=backupDb(db, backupfile)) != SQLITE_OK) {
+        if ((rc=backupDb(db, backupfile, &curr_time)) != SQLITE_OK) {
                 fprintf(stderr, "error creating backup (%d)\n", rc);
         } else {
                 fprintf(stderr, "db backup completed\n");
@@ -273,6 +343,7 @@ void backup_handler(int sig)
         }
 }
 
+static const char *event_filter = "EVENT_SRC";
 
 int main(int argc, char **argv)
 {
@@ -347,7 +418,7 @@ int main(int argc, char **argv)
                                 char sock_endpoint[256];
                                 size_t endpoint_size = sizeof(sock_endpoint);
                                 zmq_getsockopt(pollitems[i].socket, ZMQ_LAST_ENDPOINT, sock_endpoint, &endpoint_size);
-                                fprintf(stderr, "new event from %s\n", sock_endpoint);
+//                                fprintf(stderr, "new event from %s\n", sock_endpoint);
 
                                 if (pollitems[i].revents & ZMQ_POLLIN) {
                                         zframe_t *frame = zframe_recv (pollitems[i].socket);

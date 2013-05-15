@@ -1,8 +1,6 @@
 #include <string>
 #include <set>
 #include <atomic>
-#include <thread>
-#include <chrono>
 #include <mutex>
 
 #include <string.h>
@@ -20,31 +18,38 @@
 
 static int count_events(sqlite3 *sql, int *count);
 
-struct CleanupFunction {
-        void cleanup(sqlite3 *database, std::atomic_bool *run, int *lost_events, int limit) {
-                while (run->load()) {
-                        int count;
-                        std::this_thread::sleep_for(std::chrono::seconds(CLEANUP_PERIOD));
-                        if (! run->load())
-                                break;
+struct cleanup_thread_data {
+        sqlite3 *database;
+        std::atomic_bool run;
+        int limit;
+        int *lost_events;
+} cleanup_data;
 
-                        count_events(database, &count);
-                        if (count > limit) {
-                                int to_remove = count - limit;
-                                fprintf(stderr, "cleanup removing %d events (limit %d total %d)\n", to_remove, limit, count);
-                                char *zSQL = sqlite3_mprintf("DELETE FROM events WHERE id IN (SELECT id FROM EVENTS ORDER BY id LIMIT %d)", to_remove);
-                                char *err_msg = 0;
-                                if (sqlite3_exec(database, zSQL, 0, 0, &err_msg)) {
-                                        fprintf(stderr, "Cannot remove events form db %s\n", err_msg);
-                                        sqlite3_free(err_msg);
-                                } else {
-                                        *lost_events += to_remove;
-                                }
-                                sqlite3_free(zSQL);
+void *cleanup_function(void *in)
+{
+        struct cleanup_thread_data *data = (struct cleanup_thread_data *) in;
+        while (data->run.load()) {
+                int count;
+                sleep(CLEANUP_PERIOD);
+                if (! data->run.load())
+                        break;
+
+                count_events(data->database, &count);
+                if (count > data->limit) {
+                        int to_remove = count - data->limit;
+                        fprintf(stderr, "cleanup removing %d events (limit %d total %d)\n", to_remove, data->limit, count);
+                        char *zSQL = sqlite3_mprintf("DELETE FROM events WHERE id IN (SELECT id FROM EVENTS ORDER BY id LIMIT %d)", to_remove);
+                        char *err_msg = 0;
+                        if (sqlite3_exec(data->database, zSQL, 0, 0, &err_msg)) {
+                                fprintf(stderr, "Cannot remove events form db %s\n", err_msg);
+                                sqlite3_free(err_msg);
+                        } else {
+                                *(data->lost_events) += to_remove;
                         }
+                        sqlite3_free(zSQL);
                 }
         }
-};
+}
 
 zctx_t *ctx;
 zbeacon_t *beacon_ctx;
@@ -52,9 +57,7 @@ zmq_pollitem_t *pollitems;
 std::set<std::string> poll_addrs;
 sqlite3 *db;
 
-CleanupFunction *cf;
-std::thread *cleanup_thread;
-std::atomic_bool *cleanup_thread_flag;
+pthread_t cleanup_thread;
 std::once_flag terminate_flag;
 
 int lost_events = 0;
@@ -75,11 +78,9 @@ void finish(int ret)
                 zctx_destroy(&ctx);
 
         if(cleanup_thread) {
-                cleanup_thread_flag->store(false);
-                cleanup_thread->join();
-                delete cf;
-                delete cleanup_thread;
-                delete cleanup_thread_flag;
+                cleanup_data.run.store(false);
+                pthread_cancel(cleanup_thread);
+                pthread_join(cleanup_thread, NULL);
         }
 
         int count = 0;
@@ -384,9 +385,11 @@ int main(int argc, char **argv)
         beacon_item->events = ZMQ_POLLIN;
         beacon_item->revents = 0;
 
-        cf = new CleanupFunction();
-        cleanup_thread_flag = new std::atomic_bool(true);
-        cleanup_thread = new std::thread(std::bind(&CleanupFunction::cleanup, std::ref(cf), db, cleanup_thread_flag, &lost_events, limit));
+        cleanup_data.database = db;
+        cleanup_data.limit = limit;
+        cleanup_data.lost_events = &lost_events;
+        cleanup_data.run.store(true);
+        rc = pthread_create(&cleanup_thread, NULL, cleanup_function, (void *)&cleanup_data);
 
         rc = pthread_sigmask (SIG_UNBLOCK, &signal_mask, NULL);
         if (rc != 0)

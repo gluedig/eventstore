@@ -243,6 +243,7 @@ static int add_event(sqlite3 *sql, byte *event_data, size_t data_len)
         free(data_str);
         processed_events++;
         fprintf(stdout, "\b%c", progress[processed_events % 4]);
+        fflush(stdout);
         return ret;
 }
 
